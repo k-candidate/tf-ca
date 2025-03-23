@@ -1,0 +1,222 @@
+---
+- name: Deploy CA
+  hosts: all
+  become: true
+  vars:
+    vm_username: "{{ vm_username }}"
+    root_ca_key_passphrase: "{{ root_ca_key_passphrase }}"
+    ca_name: "{{ ca_name }}"
+    intermediate_ca_key_passphrase: "{{ intermediate_ca_key_passphrase }}"
+    intermediate_ca_name: "{{ intermediate_ca_name }}"
+    access_key: "{{ access_key }}"
+    secret_key: "{{ secret_key }}"
+    end_entity_domain: "{{ end_entity_domain }}"
+  tasks:
+    - name: Show Ansible version. For troubleshooting
+      debug:
+        msg: "Ansible version is  {{ ansible_version.full }}"
+
+    - name: Check if this playbook has rebooted the machine before
+      ansible.builtin.stat:
+        path: /var/tmp/ansible_rebooted_this_machine_before.txt
+      register: reboot_file
+
+    - name: Reboot on the playbook's first run to start fresh after the changes made by user data
+      ansible.builtin.reboot:
+        post_reboot_delay: 10
+        connect_timeout: 120
+      when: not reboot_file.stat.exists
+      register: reboot_result
+
+    - name: Create file to indicate reboot happened on the playbook's first run
+      ansible.builtin.file:
+        path: /var/tmp/ansible_rebooted_this_machine_before.txt
+        state: touch
+      when:
+        - reboot_file.stat.exists == false
+        - reboot_result is succeeded
+
+    - name: Prepare the directory for the Root CA
+      ansible.builtin.file:
+        path: "/root/ca/{{ item }}"
+        state: directory
+      loop:
+        - private
+        - certs
+
+    - name: Create the root private key with password protection
+      ansible.builtin.openssl_privatekey:
+        path: /root/ca/private/root-ca-key.pem
+        passphrase: "{{ root_ca_key_passphrase }}"
+        type: ECC
+        curve: secp256r1
+        mode: 400
+
+    - name: Generate Root CA CSR
+      community.crypto.openssl_csr:
+        path: /root/ca/certs/root-ca.csr
+        privatekey_path: /root/ca/private/root-ca-key.pem
+        privatekey_passphrase: "{{ root_ca_key_passphrase }}"
+        common_name: "{{ ca_name }}"
+        basic_constraints:
+          - 'CA:TRUE'
+        basic_constraints_critical: yes
+        key_usage:
+          - keyCertSign
+          - cRLSign
+          - digitalSignature
+        key_usage_critical: yes
+
+    - name: Create the root certificate
+      community.crypto.x509_certificate:
+        path: /root/ca/certs/root-ca-cert.pem
+        csr_path: /root/ca/certs/root-ca.csr
+        privatekey_path: /root/ca/private/root-ca-key.pem
+        privatekey_passphrase: "{{ root_ca_key_passphrase }}"
+        provider: selfsigned
+        selfsigned_not_after: "+7300d"
+        selfsigned_digest: "sha256"
+
+    - name: Verify root certificate
+      community.crypto.x509_certificate_info:
+        path: /root/ca/certs/root-ca-cert.pem
+      register: root_ca_cert_info
+
+    - name: Display root certificate information
+      ansible.builtin.debug:
+        var: root_ca_cert_info
+
+    - name: Prepare the directories for the Intermediate CA
+      ansible.builtin.file:
+        path: "/root/ca/intermediate/{{ item }}"
+        state: directory
+      loop:
+        - certs
+        - private
+
+    - name: Create the intermediate private key with password protection
+      community.crypto.openssl_privatekey:
+        path: "/root/ca/intermediate/private/intermediate-ca-key.pem"
+        passphrase: "{{ intermediate_ca_key_passphrase }}"
+        type: ECC
+        curve: secp256r1
+        mode: 400
+
+    - name: Generate Intermediate CA CSR
+      community.crypto.openssl_csr:
+        path: "/root/ca/intermediate/certs/intermediate-ca.csr"
+        privatekey_path: "/root/ca/intermediate/private/intermediate-ca-key.pem"
+        privatekey_passphrase: "{{ intermediate_ca_key_passphrase }}"
+        common_name: "{{ intermediate_ca_name }}"
+        basic_constraints:
+          - 'CA:TRUE'
+        basic_constraints_critical: yes
+        key_usage:
+          - keyCertSign
+          - cRLSign
+          - digitalSignature
+        key_usage_critical: yes
+
+    - name: Sign the Intermediate CA Certificate with Root CA
+      community.crypto.x509_certificate:
+        path: "/root/ca/intermediate/certs/intermediate-ca-cert.pem"
+        csr_path: "/root/ca/intermediate/certs/intermediate-ca.csr"
+        ownca_privatekey_path: /root/ca/private/root-ca-key.pem
+        ownca_privatekey_passphrase: "{{ root_ca_key_passphrase }}"
+        ownca_path: /root/ca/certs/root-ca-cert.pem
+        provider: ownca
+        ownca_not_after: "+3650d"
+
+    - name: Verify Intermediate CA certificate
+      community.crypto.x509_certificate_info:
+        path: /root/ca/intermediate/certs/intermediate-ca-cert.pem
+      register: intermediate_ca_cert_info
+
+    - name: Display Intermediate CA certificate information
+      ansible.builtin.debug:
+        var: intermediate_ca_cert_info
+
+    - name: Upload certs to Minio bucket
+      amazon.aws.aws_s3:
+        endpoint_url: "{{ endpoint_url }}"
+        bucket: devops
+        object: "certificates/{{ item.filename }}"
+        src: "{{ item.path }}{{ item.filename }}"
+        mode: put
+        encrypt: false
+        access_key: "{{ access_key }}"
+        secret_key: "{{ secret_key }}"
+      loop:
+        - path: /root/ca/certs/
+          filename: root-ca-cert.pem
+        - path: /root/ca/intermediate/certs/
+          filename: intermediate-ca-cert.pem
+        - path: /root/ca/intermediate/private/
+          filename: intermediate-ca-key.pem
+
+    - name: Prepare the directories for the end-entity cert
+      ansible.builtin.file:
+        path: "/root/ca/end-entity/{{ item }}"
+        state: directory
+      loop:
+        - certs
+        - private
+
+    - name: Create the end end-entity private key
+      community.crypto.openssl_privatekey:
+        path: "/root/ca/end-entity/private/end-entity-key.pem"
+        type: ECC
+        curve: secp256r1
+        mode: 400
+    
+    - name: Generate end-entity cert CSR
+      community.crypto.openssl_csr:
+        path: "/root/ca/end-entity/certs/end-entity.csr"
+        privatekey_path: "/root/ca/end-entity/private/end-entity-key.pem"
+        common_name: "*.{{ end_entity_domain }}"
+        subject_alt_name:
+          - "DNS:*.{{ end_entity_domain }}"
+          - "DNS:{{ end_entity_domain }}"
+
+    - name: Sign the end-entity Certificate with Intermediate
+      community.crypto.x509_certificate:
+        path: "/root/ca/end-entity/certs/end-entity-cert.pem"
+        csr_path: "/root/ca/end-entity/certs/end-entity.csr"
+        ownca_privatekey_path: /root/ca/intermediate/private/intermediate-ca-key.pem
+        ownca_privatekey_passphrase: "{{ intermediate_ca_key_passphrase }}"
+        ownca_path: /root/ca/intermediate/certs/intermediate-ca-cert.pem
+        provider: ownca
+        ownca_not_after: "+365d"
+
+    - name: Read end-entity certificate
+      ansible.builtin.slurp:
+        src: /root/ca/end-entity/certs/end-entity-cert.pem
+      register: end_entity_cert
+
+    - name: Read intermediate CA certificate
+      ansible.builtin.slurp:
+        src: /root/ca/intermediate/certs/intermediate-ca-cert.pem
+      register: intermediate_ca_cert
+
+    - name: Create chain cert
+      ansible.builtin.copy:
+        content: "{{ end_entity_cert.content | b64decode }}{{ intermediate_ca_cert.content | b64decode }}"
+        dest: "/root/ca/end-entity/certs/chain.pem"
+
+    - name: Upload end-entity cert, chain cert, and end-entity key to Minio bucket
+      amazon.aws.aws_s3:
+        endpoint_url: "{{ endpoint_url }}"
+        bucket: devops
+        object: "certificates/{{ item.filename }}"
+        src: "{{ item.path }}{{ item.filename }}"
+        mode: put
+        encrypt: false
+        access_key: "{{ access_key }}"
+        secret_key: "{{ secret_key }}"
+      loop:
+        - path: /root/ca/end-entity/certs/
+          filename: end-entity-cert.pem
+        - path: /root/ca/end-entity/private/
+          filename: end-entity-key.pem
+        - path: /root/ca/end-entity/certs/
+          filename: chain.pem

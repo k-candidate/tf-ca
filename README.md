@@ -1,2 +1,2 @@
-# tf-root-ca
-Private Root CA
+# tf-ca
+Private CA
